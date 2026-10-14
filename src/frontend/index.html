@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Azure SWA Private Backend Log Viewer</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      margin: 2rem;
+      background: #f8fafc;
+      color: #1e293b;
+    }
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+      background: white;
+      padding: 2rem;
+      border-radius: 8px;
+      box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);
+    }
+    h1 {
+      margin-top: 0;
+      color: #0f172a;
+    }
+    .badge {
+      display: inline-block;
+      padding: 0.25rem 0.5rem;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      background: #e2e8f0;
+    }
+    .badge-info { background: #dbeafe; color: #1e40af; }
+    .badge-warning { background: #fef3c7; color: #92400e; }
+    .badge-error { background: #fee2e2; color: #991b1b; }
+    button {
+      background: #2563eb;
+      color: white;
+      border: none;
+      padding: 0.6rem 1.2rem;
+      border-radius: 6px;
+      font-size: 0.95rem;
+      cursor: pointer;
+      margin-bottom: 1rem;
+    }
+    button:hover { background: #1d4ed8; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 1rem;
+    }
+    th, td {
+      border: 1px solid #e2e8f0;
+      padding: 0.75rem;
+      text-align: left;
+    }
+    th {
+      background: #f1f5f9;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Storage Table Log Viewer</h1>
+    <p>Viewing log entities retrieved privately via Azure Functions Flex Consumption backend integrated with Azure Virtual Network.</p>
+    <button id="refreshBtn" onclick="loadLogs()">Refresh Logs</button>
+    <div id="status">Loading logs...</div>
+    <table id="logTable" style="display: none;">
+      <thead>
+        <tr>
+          <th>Timestamp</th>
+          <th>Partition Key</th>
+          <th>Row Key</th>
+          <th>Severity</th>
+          <th>Message</th>
+        </tr>
+      </thead>
+      <tbody id="logBody"></tbody>
+    </table>
+  </div>
+
+  <script>
+    async function loadLogs() {
+      const status = document.getElementById('status');
+      const table = document.getElementById('logTable');
+      const body = document.getElementById('logBody');
+      status.innerText = 'Fetching logs from linked backend (/api/logs)...';
+      body.innerHTML = '';
+
+      try {
+        const response = await fetch('/api/logs');
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+        }
+        const data = await response.json();
+        status.innerText = `Retrieved ${data.count || 0} log records.`;
+
+        if (data.logs && data.logs.length > 0) {
+          table.style.display = 'table';
+          data.logs.forEach(log => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+              <td>${new Date(log.timestamp || Date.now()).toLocaleString()}</td>
+              <td><code>${log.partitionKey || ''}</code></td>
+              <td><code>${log.rowKey || ''}</code></td>
+              <td><span class="badge ${log.severity === 'Error' ? 'badge-error' : 'badge-info'}">${log.severity || 'Info'}</span></td>
+              <td>${log.message || ''}</td>
+            `;
+            body.appendChild(tr);
+          });
+        } else {
+          table.style.display = 'none';
+        }
+      } catch (err) {
+        status.innerText = 'Error loading logs: ' + err.message;
+      }
+    }
+
+    document.addEventListener('DOMContentLoaded', loadLogs);
+  </script>
+</body>
+</html>

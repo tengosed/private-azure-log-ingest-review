@@ -1,0 +1,17 @@
+{
+  "name": "swa-backend-api",
+  "version": "1.0.0",
+  "description": "Azure Functions Node.js 22 backend for reading Azure Table Storage over Private Endpoint",
+  "main": "src/functions/*.js",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "start": "func start"
+  },
+  "dependencies": {
+    "@azure/data-tables": "^13.3.1",
+    "@azure/functions": "^4.6.0",
+    "@azure/identity": "^4.5.0"
+  }
+}

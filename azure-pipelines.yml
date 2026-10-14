@@ -1,0 +1,290 @@
+# CI/CD: validate + build on every change; what-if on PRs; deploy infra, API and frontend on main.
+#
+# One-time setup (see docs/cicd.md):
+#   1. Create an Azure Resource Manager service connection (workload identity federation) with
+#      Contributor + User Access Administrator on the target resource group (Bicep creates role assignments).
+#   2. Create the resource group.
+#   3. Create an Azure DevOps Environment named by `environmentName` below (add approvals/checks there).
+#   4. Update the variables below.
+
+# Infra deploys on main only when files under infra/ changed in the triggering commit(s),
+# or when the manual run parameter `deployInfra` is true. Code stages run regardless.
+parameters:
+  - name: deployInfra
+    displayName: Force infrastructure deployment
+    type: boolean
+    default: false
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    exclude: [docs/*, '*.md']
+
+pr:
+  branches:
+    include: [main]
+  paths:
+    exclude: [docs/*, '*.md']
+
+variables:
+  serviceConnection: sc-swa-app-iac # TODO: your ARM service connection name
+  resourceGroup: rg-swapp-prod # TODO: target resource group
+  location: eastus2
+  environmentName: swapp-prod # Azure DevOps Environment (approvals live here)
+  nodeVersion: 22.x
+  deploymentName: main
+  isMain: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  - stage: Build
+    displayName: Validate & build
+    jobs:
+      - job: Build
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - bash: |
+              range="$(Build.SourceVersion)^ $(Build.SourceVersion)"
+              if [ "$(Build.Reason)" = "Manual" ] && [ "${{ parameters.deployInfra }}" = "True" ]; then
+                changed=true
+              elif git rev-parse "$(Build.SourceVersion)^" >/dev/null 2>&1 \
+                && [ -n "$(git diff --name-only $range -- infra)" ]; then
+                changed=true
+              else
+                changed=false
+              fi
+              echo "infra changed/forced: $changed"
+              echo "##vso[task.setvariable variable=infraChanged;isOutput=true]$changed"
+            name: detect
+            displayName: Detect infra changes
+          - task: NodeTool@0
+            displayName: Use Node $(nodeVersion)
+            inputs:
+              versionSpec: $(nodeVersion)
+
+          - script: |
+              az bicep build --file infra/main.bicep --stdout > /dev/null
+              az bicep build-params --file infra/main.bicepparam --stdout > /dev/null
+            displayName: Bicep build & lint
+
+          - script: npm ci --omit=dev
+            workingDirectory: src/api
+            displayName: Install API production dependencies
+
+          - task: ArchiveFiles@2
+            displayName: Package Function App
+            inputs:
+              rootFolderOrFile: src/api
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/api.zip
+              replaceExistingArchive: true
+
+          - script: npm ci --omit=dev
+            workingDirectory: src/ingest
+            displayName: Install ingest production dependencies
+
+          - task: ArchiveFiles@2
+            displayName: Package ingest Function App
+            inputs:
+              rootFolderOrFile: src/ingest
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/ingest.zip
+              replaceExistingArchive: true
+
+          - task: PublishPipelineArtifact@1
+            displayName: Publish ingest package
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)/ingest.zip
+              artifact: ingest
+
+          - task: PublishPipelineArtifact@1
+            displayName: Publish API package
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)/api.zip
+              artifact: api
+
+          - task: PublishPipelineArtifact@1
+            displayName: Publish frontend
+            inputs:
+              targetPath: src/frontend
+              artifact: frontend
+
+          - task: PublishPipelineArtifact@1
+            displayName: Publish infra
+            inputs:
+              targetPath: infra
+              artifact: infra
+
+  - stage: WhatIf
+    displayName: Infra what-if
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - job: WhatIf
+        steps:
+          - download: current
+            artifact: infra
+          - task: AzureCLI@2
+            displayName: az deployment group what-if
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az deployment group what-if \
+                  --resource-group "$(resourceGroup)" \
+                  --template-file "$(Pipeline.Workspace)/infra/main.bicep" \
+                  --parameters "$(Pipeline.Workspace)/infra/main.bicepparam"
+
+  - stage: Infra
+    displayName: Deploy infrastructure
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables.isMain, true), ne(variables['Build.Reason'], 'PullRequest'), or(eq(dependencies.Build.outputs['Build.detect.infraChanged'], 'true'), eq('${{ parameters.deployInfra }}', 'True')))
+    jobs:
+      - deployment: Infra
+        environment: $(environmentName)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: infra
+                - task: AzureCLI@2
+                  displayName: az deployment group create
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az deployment group create \
+                        --name "$(deploymentName)" \
+                        --resource-group "$(resourceGroup)" \
+                        --template-file "$(Pipeline.Workspace)/infra/main.bicep" \
+                        --parameters "$(Pipeline.Workspace)/infra/main.bicepparam"
+
+  - stage: Api
+    displayName: Deploy Function App
+    dependsOn: [Build, Infra]
+    condition: and(eq(dependencies.Build.result, 'Succeeded'), in(dependencies.Infra.result, 'Succeeded', 'Skipped'), eq(variables.isMain, true), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - deployment: Api
+        environment: $(environmentName)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: api
+                - task: AzureCLI@2
+                  displayName: Resolve Function App name
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      name=$(az deployment group show -g "$(resourceGroup)" -n "$(deploymentName)" \
+                        --query properties.outputs.functionAppName.value -o tsv)
+                      echo "##vso[task.setvariable variable=functionAppName]$name"
+                - task: AzureFunctionApp@2
+                  displayName: Deploy to Flex Consumption
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    appType: functionAppLinux
+                    isFlexConsumption: true
+                    appName: $(functionAppName)
+                    package: $(Pipeline.Workspace)/api/api.zip
+                    runtimeStack: NODE|22
+
+  - stage: Ingest
+    displayName: Deploy ingest Function App
+    dependsOn: [Build, Infra]
+    condition: and(eq(dependencies.Build.result, 'Succeeded'), in(dependencies.Infra.result, 'Succeeded', 'Skipped'), eq(variables.isMain, true), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - deployment: Ingest
+        environment: $(environmentName)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: ingest
+                - task: AzureCLI@2
+                  displayName: Resolve ingest Function App name
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      name=$(az deployment group show -g "$(resourceGroup)" -n "$(deploymentName)" \
+                        --query properties.outputs.ingestFunctionName.value -o tsv)
+                      echo "##vso[task.setvariable variable=ingestFunctionName]$name"
+                # The ingest app (and its SCM site) only admits allowedCallerIps, so temporarily admit this agent.
+                - task: AzureCLI@2
+                  displayName: Temporarily allow agent IP on ingest app
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      ip=$(curl -fsS https://api.ipify.org)
+                      echo "Allowing $ip on $(ingestFunctionName)"
+                      az functionapp config access-restriction add -g "$(resourceGroup)" -n "$(ingestFunctionName)" \
+                        --rule-name deploy-temp --action Allow --ip-address "$ip/32" --priority 100 -o none
+                      sleep 30 # rule propagation
+                - task: AzureFunctionApp@2
+                  displayName: Deploy ingest to Flex Consumption
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    appType: functionAppLinux
+                    isFlexConsumption: true
+                    appName: $(ingestFunctionName)
+                    package: $(Pipeline.Workspace)/ingest/ingest.zip
+                    runtimeStack: NODE|22
+                - task: AzureCLI@2
+                  displayName: Remove temporary agent IP rule
+                  condition: always()
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az functionapp config access-restriction remove -g "$(resourceGroup)" -n "$(ingestFunctionName)" \
+                        --rule-name deploy-temp -o none || true
+
+  - stage: Frontend
+    displayName: Deploy Static Web App
+    dependsOn: [Build, Infra]
+    condition: and(eq(dependencies.Build.result, 'Succeeded'), in(dependencies.Infra.result, 'Succeeded', 'Skipped'), eq(variables.isMain, true), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - deployment: Frontend
+        environment: $(environmentName)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: frontend
+                - task: NodeTool@0
+                  inputs:
+                    versionSpec: $(nodeVersion)
+                - task: AzureCLI@2
+                  displayName: Deploy with SWA CLI
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      swa_name=$(az deployment group show -g "$(resourceGroup)" -n "$(deploymentName)" \
+                        --query properties.outputs.staticWebAppName.value -o tsv)
+                      token=$(az staticwebapp secrets list -n "$swa_name" -g "$(resourceGroup)" \
+                        --query properties.apiKey -o tsv)
+                      echo "##vso[task.setvariable variable=SWA_CLI_DEPLOYMENT_TOKEN;issecret=true]$token"
+                      SWA_CLI_DEPLOYMENT_TOKEN="$token" npx --yes @azure/static-web-apps-cli deploy \
+                        "$(Pipeline.Workspace)/frontend" --env production
